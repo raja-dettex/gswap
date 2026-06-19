@@ -1,36 +1,23 @@
 use std::sync::{Arc, atomic::{AtomicPtr, AtomicUsize, Ordering}};
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 
-
-#[derive(Clone)]
-pub (crate) struct GSwap<T> { 
+pub  struct GSwap<T> { 
     ptr: Atomic<Arc<T>>
 }
 
-pub struct Inner<T> { 
-    strong: AtomicUsize,
-    weak : AtomicUsize,
-    data: T
+impl<T> Drop for GSwap<T> {
+    fn drop(&mut self) {
+        let guard = crossbeam_epoch::pin();
+        let shared = self.ptr.swap(crossbeam_epoch::Shared::null(), Ordering::AcqRel, &guard);
+        // safety here when finally gswap is dropped, it takes the mutable reference of gswap none other holds it then
+        // the last published ptr is swapped with null, we have exclusive ownership of the old pointer
+        // own it by into_owned allocation
+        // and finally dropping released the owned allocation
+        if !shared.is_null() { 
+            unsafe { drop(shared.into_owned()); }
+        }
+    }
 }
-
-pub(crate) struct ReadGuard<'g, T> { 
-    shared: Shared<'g, T>,
-    guard: Guard
-}
-
-// impl<T> Drop for ReadGuard<T> {
-//     fn drop(&mut self) {
-//         unsafe { (*self.readers).fetch_sub(1, Ordering::SeqCst); }
-//     }
-// }
-
-// impl<T> std::ops::Deref for ReadGuard<T> {
-//     type Target = T;
-
-//     fn deref(&self) -> &Self::Target {
-//         &*self.arc
-//     }
-// }
 
 
 impl<T> GSwap<T> { 
@@ -63,34 +50,14 @@ impl<T> GSwap<T> {
         *old_arc
     }
     
-    // pub fn read(&self) -> ReadGuard<T> {
-    //     self.readers.fetch_add(1, Ordering::SeqCst); 
-    //     let ptr = self.item.load(Ordering::SeqCst);
-    //     let arc = unsafe { &*ptr.clone()};
-    //     ReadGuard { 
-    //         arc: arc.clone(),
-    //         readers: &self.readers
-    //     }
-    // }
-
-    // pub fn write(&self, item: T)  { 
-    //     // TODO: first check all the readers are dropped or not,
-    //     let new_boxed = Box::new(Arc::new(item));
-    //     let ptr = Box::into_raw(new_boxed);
-    //     let old = self.item.swap(ptr, Ordering::SeqCst);
-    //     while self.readers.load(Ordering::Acquire) != 0 { 
-    //         std::hint::spin_loop();
-    //     }
-    //     unsafe { 
-    //         drop(Box::from_raw(old));
-    //     }
-    // }
 }
 
 
 #[cfg(test)]
 mod tests {
-    use crate::GSwap;
+    use std::sync::Arc;
+
+use crate::GSwap;
 
 
     #[test]
@@ -115,7 +82,7 @@ mod tests {
     #[test]
     pub fn many_readers_one_writer() { 
         use std::thread;
-        let swap = GSwap::new(0u64);
+        let swap = Arc::new(GSwap::new(0u64));
         let mut handles = Vec::new();
         for _ in 0..8 { 
             let swap = swap.clone();
@@ -138,34 +105,6 @@ mod tests {
             let _ = handle.join();
         }
     }
-
-    // #[test]
-    // pub fn single_reader_single_writer() { 
-    //     let gs = GSwap::new(5 as u8);
-    //     let item = gs.read().arc.clone();
-    //     println!("item: {}", item); 
-
-    //     // write to it now and then read
-    //     gs.write(6);
-    //     let another = gs.read().arc.clone();
-    //     println!("item: {}", another); 
-    
-    // }
-    // #[test]
-    // pub fn concurrent_readers_and_writers() { 
-    //     let gs = GSwap::new(5 as u8);
-    //     let item = gs.read().arc.clone();
-    //     println!("item: {}", item); 
-    //     std::thread::spawn(move || { 
-    //         let item = gs.read().arc.clone();
-    //     });
-    //     // write to it now and then read
-    //     gs.write(6);
-    //     let another = gs.read().arc.clone();
-    //     println!("item: {}", another); 
-    
-    // }
-
     
     
 }

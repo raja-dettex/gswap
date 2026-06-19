@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 crossbeam-epoch = "0.9.18"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "gwap"
+harness = false
