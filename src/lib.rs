@@ -1,5 +1,7 @@
 use std::{cell::Cell, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering}}};
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
+mod gen_lock;
+mod guard;
 
 const EMPTY_GENERATOIN: usize = usize::MAX;
 const MAX_READERS: usize = 64;
