@@ -1,12 +1,21 @@
 use std::sync::{Arc, Mutex, atomic::{AtomicPtr, AtomicUsize, Ordering}};
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 
+const EMPTY_GENERATOIN: usize = usize::MAX;
+const MAX_READERS: usize = 64;
 
-struct RetiredPtr<T>(*mut Arc<T>);
+struct ReaderSlot { 
+    generation: AtomicUsize
+}
+struct RetiredPtr<T> { 
+    ptr: *mut Arc<T>,
+    generation: usize
+}
 pub  struct GSwap<T> { 
     current: AtomicPtr<Arc<T>>,
+    global_generation: AtomicUsize,
+    readers: Vec<ReaderSlot>,
     retired: Mutex<Vec<RetiredPtr<T>>>,
-    active_readers: AtomicUsize
 }
 
 unsafe impl<T: Send + Sync> Send for RetiredPtr<T> {}
@@ -30,20 +39,33 @@ unsafe impl<T: Send + Sync> Sync for RetiredPtr<T> {}
 impl<T> GSwap<T> { 
     pub fn new(item: T) -> Self { 
         let boxed = Box::new(Arc::new(item));
+        let mut readers= Vec::new();
+        for _ in 0..MAX_READERS { 
+            readers.push(ReaderSlot { generation: AtomicUsize::new(EMPTY_GENERATOIN)});
+        }
         Self { 
             current: AtomicPtr::new(Box::into_raw(boxed)),
+            readers,
+            global_generation: AtomicUsize::new(0),
             retired: Mutex::new(Vec::new()),
-            active_readers: AtomicUsize::new(0)
         }
+    }
+    
+    pub fn acquire_slot(&self) -> usize { 
+        0
     }
     // all the load is guarded by epoch based reclaimation
     // any thread comes and laod the pointer it gives back a shared pointer Shared<'g, Arc<T>> which is *const Arc<T> and guarded by guard
     // guard is pinned here and its lifetime is the lifetime of the caller. caller has to ensure that
     pub fn load(&self) -> Arc<T> { 
-        self.active_readers.fetch_add(1, Ordering::Acquire);
+        // slot registration for now slot is fixed to 0, 
+        // TODO: implement slot registration
+        let slot = self.acquire_slot();
+        let generation = self.global_generation.load(Ordering::Acquire);
+        self.readers[slot].generation.store(generation, Ordering::Release);
         let ptr = self.current.load(Ordering::Acquire);
         let arc = unsafe { Arc::clone(&*ptr) };
-        self.active_readers.fetch_sub(1, Ordering::Release);
+        self.readers[slot].generation.store(EMPTY_GENERATOIN, Ordering::Release);
         arc
 
     }
@@ -53,25 +75,38 @@ impl<T> GSwap<T> {
     pub fn store(&self, item: T) {
         let boxed = Box::new(Arc::new(item));
         let old = self.current.swap(Box::into_raw(boxed), Ordering::Release);
-        self.retired.lock().expect("cant hold").push(RetiredPtr(old));
+        let old_gen = self.global_generation.fetch_add(1, Ordering::Release);
+        self.retired.lock().expect("cant hold").push(RetiredPtr{
+            ptr: old, 
+            generation: old_gen
+        });
         self.try_reclaim();
     }
-    pub fn swap(&self, value: T) -> Arc<T> { 
-        let boxed = Box::new(Arc::new(value));
-        let old = self.current.swap(Box::into_raw(boxed), Ordering::Release);
-        self.retired.lock().expect("cant hold from swap").push(RetiredPtr(old));
-        let old_arc = unsafe { Arc::clone(&*old) };
-        self.try_reclaim();
-        old_arc
-    }
+    // pub fn swap(&self, value: T) -> Arc<T> { 
+    //     let boxed = Box::new(Arc::new(value));
+    //     let old = self.current.swap(Box::into_raw(boxed), Ordering::Release);
+    //     self.retired.lock().expect("cant hold from swap").push(RetiredPtr(old));
+    //     let old_arc = unsafe { Arc::clone(&*old) };
+    //     self.try_reclaim();
+    //     old_arc
+    // }
 
 
     pub fn try_reclaim(&self) { 
-        if self.active_readers.load(Ordering::Acquire) != 0 { 
-            return;
-        }
-        for retired_ptr in self.retired.lock().expect("can not hold from reclaimn").drain(..) { 
-            unsafe { drop(Box::from_raw(retired_ptr.0)); }
+        let oldest_reader = self.readers.iter()
+            .map(|r| r.generation.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(EMPTY_GENERATOIN);
+        let mut retired_list = self.retired.lock().expect("retired list");
+        let retired_len = retired_list.len();
+        let mut i = 0;
+        while i < retired_list.len() { 
+            if retired_list[i].generation < oldest_reader { 
+                let retired_ptr = retired_list.swap_remove(i);
+                unsafe { drop(Box::from_raw(retired_ptr.ptr));}
+            } else { 
+                i += 1;
+            }
         }
     }
     
@@ -94,15 +129,15 @@ use crate::GSwap;
 
     }
 
-    #[test]
-    fn swap_returns_old() {
-        let swap = GSwap::new(5u64);
-        println!("swapping");
-        let old = swap.swap(10);
-        println!("Deref old");
-        assert_eq!(*old, 5);
-        assert_eq!(*swap.load(), 10);
-    }
+    // #[test]
+    // fn swap_returns_old() {
+    //     let swap = GSwap::new(5u64);
+    //     println!("swapping");
+    //     let old = swap.swap(10);
+    //     println!("Deref old");
+    //     assert_eq!(*old, 5);
+    //     assert_eq!(*swap.load(), 10);
+    // }
 
     #[test]
     pub fn reader_keeps_old_versions_alive() { 
