@@ -38,14 +38,13 @@ impl GenLock {
         self.generation.fetch_add(1, Ordering::Release)
     } 
 
-    pub fn wait_for_readers(&self) { 
-        let generation = self.generation.load(Ordering::Acquire);
+    pub fn wait_for_readers(&self, generation: usize) { 
         if generation % 2 == 0 {
-            if self.readers_even.load(Ordering::Acquire) != 0 { 
+            while self.readers_even.load(Ordering::Acquire) != 0 { 
                 std::hint::spin_loop();
             }
         } else {
-            if self.readers_odd.load(Ordering::Acquire) != 0 { 
+            while self.readers_odd.load(Ordering::Acquire) != 0 { 
                 std::hint::spin_loop();
             } 
         }        
