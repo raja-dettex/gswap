@@ -6,7 +6,7 @@ thread_local! {
     static DEBT_SLOT: Cell<Option<usize>> = Cell::new(None)
 }
 pub(crate) struct DebtSlot<T> { 
-    ptr: AtomicPtr<Arc<T>>,
+    ptr: AtomicPtr<T>,
     registered: AtomicBool,
     paid: AtomicBool
 }
@@ -47,14 +47,14 @@ impl<T> DebtRegistry<T> {
         })
     }
 
-    pub(crate) fn register(&self, ptr: *mut Arc<T>) -> usize { 
+    pub(crate) fn register(&self, ptr: *mut T) -> usize { 
         let slot = self.acquire_slot();
         self.slots[slot].ptr.store(ptr, Ordering::Release);
         self.slots[slot].paid.store(false, Ordering::Release);
         slot
     }
 
-    pub(crate) fn pay(&self, ptr: *mut Arc<T>) { 
+    pub(crate) fn pay(&self, ptr: *mut T) { 
         for slot in &self.slots { 
             let debt_ptr = slot.ptr.load(Ordering::Acquire);
             if debt_ptr != ptr {

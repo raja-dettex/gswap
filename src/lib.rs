@@ -6,37 +6,46 @@ mod gen_lock;
 mod guard;
 mod debt;
 
-const EMPTY_GENERATOIN: usize = usize::MAX;
-const MAX_READERS: usize = 64;
-
-thread_local! {
-    static SLOT_ID: Cell<Option<usize>> = Cell::new(None);
-}
-
 struct RetiredPtr<T> { 
-    ptr: *mut Arc<T>,
+    ptr: *mut T,
 }
 pub struct LoadGuard<'a, T> { 
-    ptr: *mut Arc<T>,
+    ptr: *mut T,
     debt_slot: usize,
     owner: &'a GSwap<T>,
-    guard: Guard<'a>
 }
 
 // safety here is we are derefencing a valid pointer and contructing the borrow of arc of raw pointer
 // the raw pointer itself is originated from one arc refer to [GSwap::load_borrow]
 impl<T> LoadGuard<'_, T> { 
     pub fn upgrade(&self) -> Arc<T> {
+
+        // fast path: swap paid the debt and arc strong count is incremented. 
         if let Some(arc) = self.owner.debt_registry.collect(self.debt_slot) { 
             return arc;
         }
-        unsafe { Arc::clone(&*self.ptr) }
+
+        // slow path
+        let _guard = Guard::new(&self.owner.gen_lock);
+        
+        unsafe { 
+            
+            Arc::increment_strong_count(self.ptr as *const T);
+            Arc::from_raw(self.ptr as *const T) 
+        }
     }
 }
 pub  struct GSwap<T> { 
-    current: AtomicPtr<Arc<T>>,
+    // published pointer
+    current: AtomicPtr<T>,
+    
+    // fallback synchronization
     gen_lock: GenLock,
+
+    // fast path ownership transfer
     debt_registry: DebtRegistry<T>,
+
+    // list of deferred destruction
     retired: Mutex<Vec<RetiredPtr<T>>>,
 }
 
@@ -46,62 +55,32 @@ unsafe impl<T: Send + Sync> Sync for RetiredPtr<T> {}
 
 impl<T> GSwap<T> { 
     pub fn new(item: T) -> Self { 
-        let boxed = Box::new(Arc::new(item));
+        let ptr = Arc::into_raw(Arc::new(item)) as *mut T;
         let gen_lock = GenLock::new();
         Self { 
-            current: AtomicPtr::new(Box::into_raw(boxed)),
+            current: AtomicPtr::new(ptr),
             gen_lock,
             debt_registry: DebtRegistry::new(),
             retired: Mutex::new(Vec::new()),
         }
     }
-    
-    // pub fn acquire_slot(&self) -> usize { 
-    //     SLOT_ID.with(|slot_id| { 
-    //         if let Some(slot) = slot_id.get() { 
-    //             return slot
-    //         }
-    //         for (idx, slot) in self.readers.iter().enumerate() { 
-    //             let acquired = slot.registered.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok();
-    //             if acquired { 
-    //                 slot_id.set(Some(idx));
-    //                 return idx;
-    //             }
-    //         }
-    //         panic!("no available readers slot");
-    //     })
-    // }
-    
-    // pub fn load(&self) -> Arc<T> { 
-    //     // slot registration for now slot is fixed to 0, 
-    //     // TODO: implement slot registration
-    //     let slot = self.acquire_slot();
-    //     let generation = self.global_generation.load(Ordering::Acquire);
-    //     self.readers[slot].generation.store(generation, Ordering::Release);
-    //     let ptr = self.current.load(Ordering::Acquire);
-    //     let arc = unsafe { Arc::clone(&*ptr) };
-    //     self.readers[slot].generation.store(EMPTY_GENERATOIN, Ordering::Release);
-    //     arc
 
-    // }
-    // this proves the later derefecing of the ptr is safe 
-    // protected by guard. 
+    
     pub fn load_borrow(&self) -> LoadGuard<'_, T> { 
-        let guard = Guard::new(&self.gen_lock);
         let ptr = self.current.load(Ordering::Acquire);
         let debt_slot = self.debt_registry.register(ptr);
-        LoadGuard { ptr, debt_slot, owner: self, guard }
+        LoadGuard { ptr, debt_slot, owner: self }
     }
 
-    // the safe reclaimation gurantee here is gen_lock.wait_for_readers(old_gen);
     pub fn swap(&self, value: T)  { 
-        let boxed = Box::new(Arc::new(value));
-        let old = self.current.swap(Box::into_raw(boxed), Ordering::Release);
-        let old_gen = self.gen_lock.flip_generation();
-        self.retired.lock().expect("cant hold from swap").push(RetiredPtr { 
-            ptr: old,
-        });
-        self.gen_lock.wait_for_readers(old_gen);
+        let boxed = Arc::new(value);
+        let old = self.current.swap(Arc::into_raw(boxed) as *mut T, Ordering::Release);
+
+        // fast path
+        self.debt_registry.pay(old);
+        self.retired.lock().expect("should hold it").push(RetiredPtr { ptr: old });
+        
+        
         self.try_reclaim();
     }
 
@@ -109,7 +88,7 @@ impl<T> GSwap<T> {
     pub fn try_reclaim(&self) { 
         for retired in self.retired.lock().expect("retired list").drain(..) { 
             self.debt_registry.pay(retired.ptr);
-            unsafe { drop(Box::from_raw(retired.ptr)); }
+            unsafe { drop(Arc::from_raw(retired.ptr)); }
         }
     }
     
@@ -143,15 +122,6 @@ use crate::{GSwap, READ_ITERS, WRITE_ITERS};
 
     }
 
-    // #[test]
-    // fn swap_returns_old() {
-    //     let swap = GSwap::new(5u64);
-    //     println!("swapping");
-    //     let old = swap.swap(10);
-    //     println!("Deref old");
-    //     assert_eq!(*old, 5);
-    //     assert_eq!(*swap.load(), 10);
-    // }
 
     #[test]
     pub fn reader_keeps_old_versions_alive() { 
