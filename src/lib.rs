@@ -19,20 +19,17 @@ pub struct LoadGuard<'a, T> {
 // the raw pointer itself is originated from one arc refer to [GSwap::load_borrow]
 impl<T> LoadGuard<'_, T> { 
     pub fn upgrade(&self) -> Arc<T> {
-
-        // fast path: swap paid the debt and arc strong count is incremented. 
-        if let Some(arc) = self.owner.debt_registry.collect(self.debt_slot) { 
-            return arc;
-        }
-
-        // slow path
-        let _guard = Guard::new(&self.owner.gen_lock);
-        
-        unsafe { 
-            
-            Arc::increment_strong_count(self.ptr as *const T);
-            Arc::from_raw(self.ptr as *const T) 
-        }
+        match self.owner.debt_registry.collect(self.debt_slot) {
+            debt::DebtResult::Paid(arc) => arc,
+            debt::DebtResult::ReaderOwns(ptr) =>  { 
+                let _publication = Guard::new(&self.owner.gen_lock);
+                unsafe { 
+                    Arc::increment_strong_count(ptr as *const T);
+                    Arc::from_raw(ptr as *const T)
+                }
+            },
+            debt::DebtResult::Pending => unreachable!("debt protocol invariant broken"),
+        }   
     }
 }
 pub  struct GSwap<T> { 
