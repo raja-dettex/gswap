@@ -39,7 +39,7 @@ pub  struct GSwap<T> {
     // published pointer
     current: AtomicPtr<T>,
     
-    // fallback synchronization
+    // publication synchronization
     gen_lock: GenLock,
 
     // fast path ownership transfer
@@ -67,16 +67,24 @@ impl<T> GSwap<T> {
 
     
     pub fn load_borrow(&self) -> LoadGuard<'_, T> { 
+        // publication critical section
+        let publication_guard = Guard::new(&self.gen_lock);
         let ptr = self.current.load(Ordering::Acquire);
         let debt_slot = self.debt_registry.register(ptr);
+        drop(publication_guard);
         LoadGuard { ptr, debt_slot, owner: self }
     }
 
     pub fn swap(&self, value: T)  { 
         let boxed = Arc::new(value);
         let old = self.current.swap(Arc::into_raw(boxed) as *mut T, Ordering::Release);
-
-        // fast path
+        // wait for all publications first
+        let old_gen = self.gen_lock.flip_generation();
+        self.gen_lock.wait_for_readers(old_gen);
+        // Now every reader that could have observed 'old' has either
+        // 1. registered the debt
+        // or 
+        // 2. observed the new pointer
         self.debt_registry.pay(old);
         self.retired.lock().expect("should hold it").push(RetiredPtr { ptr: old });
         

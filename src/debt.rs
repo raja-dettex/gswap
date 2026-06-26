@@ -49,8 +49,8 @@ impl<T> DebtRegistry<T> {
 
     pub(crate) fn register(&self, ptr: *mut T) -> usize { 
         let slot = self.acquire_slot();
-        self.slots[slot].ptr.store(ptr, Ordering::Release);
         self.slots[slot].paid.store(false, Ordering::Release);
+        self.slots[slot].ptr.store(ptr, Ordering::Release);
         slot
     }
 
@@ -82,22 +82,19 @@ impl<T> DebtRegistry<T> {
 
         let ptr = self.slots[slot]
             .ptr
-            .load(Ordering::Acquire);
-
-        if ptr.is_null() {
+            .swap(
+                std::ptr::null_mut(),
+                Ordering::AcqRel,
+            );
+        if ptr.is_null() { 
             return None;
         }
 
-        self.slots[slot]
-            .ptr
-            .store(
-                std::ptr::null_mut(),
-                Ordering::Release,
-            );
-
-        Some(unsafe {
+        let arc = unsafe {
             Arc::from_raw(ptr as *const T)
-        })
+        };
+        self.slots[slot].paid.store(false, Ordering::Release);
+        Some(arc)
     }
     
 }
